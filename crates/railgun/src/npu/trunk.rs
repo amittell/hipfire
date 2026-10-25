@@ -629,6 +629,12 @@ impl NpuTrunkRuntime {
             OpenOptions::default(),
         )
     }
+    /// The physical `libamdhip64` file the relay's HIP runtime resolved to, for
+    /// the two-HIP-runtime guard of #926; `None` when it cannot be determined.
+    pub fn hip_mapped_library(&self) -> Option<String> {
+        self.hip.mapped_hip_library()
+    }
+
     /// CPU oracle access requires `cpu_reads`; a 1 ns watchdog forces the real
     /// timeout path in the transport gate without a production environment flag.
     pub fn open_with_options(

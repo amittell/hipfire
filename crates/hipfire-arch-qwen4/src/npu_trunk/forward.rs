@@ -77,6 +77,36 @@ struct EmulationScratch {
 fn fail(e: impl std::fmt::Display) -> Qwen4GpuForwardError {
     invalid(format!("npu-trunk: {e}"))
 }
+/// The #926 two-HIP-runtime guard, in the pure form the tests drive: `None`
+/// passes. Either side's path may be unknown (lookup failed, or the serving GPU
+/// runtime has not loaded yet) — that is not evidence of divergence. Known paths
+/// compare canonically so a `libamdhip64.so` symlink and the `libamdhip64.so.7`
+/// it points at are one library, while two installs stay two.
+pub(super) fn two_hip_runtime_reason_paths(
+    relay: Option<&str>,
+    serving: Option<&str>,
+) -> Option<String> {
+    let (relay, serving) = (relay?, serving?);
+    if same_library_file(relay, serving) {
+        return None;
+    }
+    Some(format!(
+        "two HIP runtimes: the NPU relay loaded {relay} but the serving GPU runtime \
+         runs {serving}; point HIPFIRE_ROCM_PATH (and LD_LIBRARY_PATH) at one install \
+         so a single runtime serves both"
+    ))
+}
+
+/// Canonical-path identity: symlink aliases of one file are equal, distinct
+/// files are not; when canonicalization fails the paths compare as strings.
+fn same_library_file(a: &str, b: &str) -> bool {
+    let canon = |p: &str| {
+        std::fs::canonicalize(p)
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| p.to_owned())
+    };
+    canon(a) == canon(b)
+}
 fn stream(gpu: &Gpu) -> *mut c_void {
     gpu.active_stream
         .as_ref()
@@ -806,21 +836,33 @@ impl NpuForward {
                     Ok(n) if n > 0 => Some(n),
                     _ => { eprintln!("npu-trunk: HIPFIRE_QWEN4_NPU_TRUNK_FAULT_CHAIN={v:?} ignored (expects a chain number >= 1)"); None }
                 });
-                Some(
-                    NpuTrunkRuntime::open_with_builder(
-                        programs,
-                        resident,
-                        trunk::TRUNK_BANKS,
-                        trunk::TRUNK_ROWS_MAX,
-                        &pci,
-                        OpenOptions {
-                            fault_chain,
-                            ..OpenOptions::default()
-                        },
-                        Some(builder),
-                    )
-                    .map_err(fail)?,
+                let opened = NpuTrunkRuntime::open_with_builder(
+                    programs,
+                    resident,
+                    trunk::TRUNK_BANKS,
+                    trunk::TRUNK_ROWS_MAX,
+                    &pci,
+                    OpenOptions {
+                        fault_chain,
+                        ..OpenOptions::default()
+                    },
+                    Some(builder),
                 )
+                .map_err(fail)?;
+                // Fail closed on the residual #926 shape: `open_hip` reuses an
+                // already-mapped runtime by SONAME, so a second runtime only
+                // enters through a pre-existing mapping of another install. Two
+                // coexisting runtimes do not order their events against each
+                // other, so paired prefill would read stale panels; refuse
+                // instead. Under `auto` the admission barrier renders this as one
+                // WARN line and a GPU-only load; under `on` it fails the load.
+                if let Some(reason) = two_hip_runtime_reason_paths(
+                    opened.hip_mapped_library().as_deref(),
+                    hip_bridge::mapped_hip_library(),
+                ) {
+                    return Err(fail(reason));
+                }
+                Some(opened)
             } else {
                 None
             };
@@ -2753,6 +2795,53 @@ mod tests {
     use super::*;
     use crate::npu_trunk::load_calibration;
     use hipfire_runtime::coproc::Calibration;
+    #[test]
+    fn two_hip_runtime_guard_passes_on_unknown_or_matching_paths() {
+        // An unknown path on either side is no evidence of a second runtime.
+        assert_eq!(
+            two_hip_runtime_reason_paths(None, Some("/opt/rocm/lib/libamdhip64.so")),
+            None
+        );
+        assert_eq!(
+            two_hip_runtime_reason_paths(Some("/opt/rocm/lib/libamdhip64.so"), None),
+            None
+        );
+        // Symlink alias and its target are one library (real files, real symlink).
+        let tmp = std::env::temp_dir().join(format!(
+            "hipfire-two-runtime-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let real = tmp.join("libamdhip64.so.7");
+        std::fs::write(&real, b"").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, tmp.join("libamdhip64.so")).unwrap();
+        let alias = tmp.join("libamdhip64.so");
+        assert_eq!(
+            two_hip_runtime_reason_paths(
+                Some(alias.to_str().unwrap()),
+                Some(real.to_str().unwrap())
+            ),
+            None
+        );
+        // Two distinct files refuse, naming both paths and the remedy.
+        let other = tmp.join("therock-libamdhip64.so");
+        std::fs::write(&other, b"").unwrap();
+        let reason = two_hip_runtime_reason_paths(
+            Some(alias.to_str().unwrap()),
+            Some(other.to_str().unwrap()),
+        )
+        .expect("distinct libraries must refuse");
+        assert!(reason.starts_with("two HIP runtimes:"), "{reason}");
+        assert!(reason.contains(alias.to_str().unwrap()), "{reason}");
+        assert!(reason.contains(other.to_str().unwrap()), "{reason}");
+        assert!(reason.contains("HIPFIRE_ROCM_PATH"), "{reason}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
     #[test]
     fn family_override_parser_selects_groups_and_rejects_unknowns() {
         assert_eq!(parse_family_override("all").unwrap(), FamilyMask::ALL);

@@ -8,11 +8,65 @@
 use crate::error::{HipError, HipResult};
 use crate::plan_tape::{PlanEvent, PlanGate, PlanTape};
 use crate::{DeviceBuffer, MemcpyKind};
+use core::ffi::CStr;
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString, OsStr, OsString};
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+extern "C" {
+    fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
+}
+
+/// `struct dl_addr` of `dladdr(3)`; only `dli_fname` is read.
+#[repr(C)]
+struct DlInfo {
+    dli_fname: *const c_char,
+    dli_fbase: *mut c_void,
+    dli_sname: *const c_char,
+    dli_saddr: *mut c_void,
+}
+
+/// Real path of the shared object backing `ptr` (`dladdr`), when it resolves.
+fn dladdr_fname(ptr: *const c_void) -> Option<String> {
+    let mut info = DlInfo {
+        dli_fname: ptr::null(),
+        dli_fbase: ptr::null_mut(),
+        dli_sname: ptr::null(),
+        dli_saddr: ptr::null_mut(),
+    };
+    // SAFETY: `info` is a valid out-pointer for the lifetime of the call.
+    if unsafe { dladdr(ptr, &mut info) } == 0 || info.dli_fname.is_null() {
+        return None;
+    }
+    // SAFETY: dladdr leaves a NUL-terminated path there on success.
+    Some(
+        unsafe { CStr::from_ptr(info.dli_fname) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// Physical `libamdhip64` file the serving GPU runtime mapped in this process
+/// (first loader wins; set once at [`HipRuntime::load`]). The NPU trunk compares
+/// the relay's runtime against this so two coexisting HIP runtimes cannot order
+/// their events against each other unnoticed (#926). Comparison canonicalizes:
+/// a path and its `libamdhip64.so` symlink alias are the same library.
+static MAPPED_HIP_LIBRARY: OnceLock<String> = OnceLock::new();
+
+fn record_mapped_hip_library(runtime: &HipRuntime) {
+    // SAFETY: reading the mapped-object path of a resolved symbol; no HIP call.
+    if let Some(path) = dladdr_fname(runtime.fn_init as *const c_void) {
+        let _ = MAPPED_HIP_LIBRARY.set(path);
+    }
+}
+
+/// Path of the physical `libamdhip64` file the serving GPU runtime mapped in
+/// this process, if one loaded. `None` is no evidence of a second runtime.
+pub fn mapped_hip_library() -> Option<&'static str> {
+    MAPPED_HIP_LIBRARY.get().map(|s| s.as_str())
+}
 
 #[cfg(feature = "kernel-timing")]
 pub mod kernel_timing;
@@ -1524,6 +1578,7 @@ impl HipRuntime {
         // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (runtime.fn_init)(0) };
         runtime.check(code, "hipInit")?;
+        record_mapped_hip_library(&runtime);
         Ok(runtime)
     }
 

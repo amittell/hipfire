@@ -48,7 +48,16 @@ mod sys {
         pub fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         pub fn dlclose(handle: *mut c_void) -> c_int;
         pub fn dlerror() -> *mut c_char;
+        pub fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
         pub fn close(fd: c_int) -> c_int;
+    }
+    /// `struct dl_addr` of `dladdr(3)`; only `dli_fname` is read.
+    #[repr(C)]
+    pub struct DlInfo {
+        pub dli_fname: *const c_char,
+        pub dli_fbase: *mut c_void,
+        pub dli_sname: *const c_char,
+        pub dli_saddr: *mut c_void,
     }
     pub const RTLD_NOW: c_int = 2;
     pub const RTLD_NOLOAD: c_int = 4;
@@ -251,6 +260,34 @@ fn dl_error() -> String {
     }
 }
 
+/// Real path of the shared object backing `ptr` (`dladdr`), when it resolves.
+///
+/// This is the object identity the two-HIP-runtime guard compares: `dlopen` by
+/// path does not deduplicate by SONAME, so a pre-existing mapping of a different
+/// install plus a by-path load leaves two runtimes in the process whose events do
+/// not order against each other (#926). String paths alone are not identity
+/// (`libamdhip64.so` is often a symlink of `libamdhip64.so.7`), so callers
+/// canonicalize before comparing.
+pub(crate) fn dladdr_fname(ptr: *const c_void) -> Option<String> {
+    let mut info = sys::DlInfo {
+        dli_fname: core::ptr::null(),
+        dli_fbase: core::ptr::null_mut(),
+        dli_sname: core::ptr::null(),
+        dli_saddr: core::ptr::null_mut(),
+    };
+    // SAFETY: `info` is a valid out-pointer for the lifetime of the call; dladdr
+    // only writes into it.
+    if unsafe { sys::dladdr(ptr, &mut info) } == 0 || info.dli_fname.is_null() {
+        return None;
+    }
+    // SAFETY: dladdr leaves a NUL-terminated path there on success.
+    Some(
+        unsafe { CStr::from_ptr(info.dli_fname) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
 /// dlsym every name in `names` from `lib` (opened as `source`); `Err` lists the missing ones (the library is NOT
 /// closed here).
 fn resolve<const N: usize>(
@@ -415,6 +452,14 @@ fn load_with_gpu(prefix: &'static str) -> Result<(Api, GpuApi), String> {
 }
 
 impl Api {
+    /// Physical file the loader mapped for this runtime (`hipInit` lives in it).
+    ///
+    /// `None` when `dladdr` cannot resolve it, which the two-runtime guard treats
+    /// as no evidence of divergence rather than a failure.
+    pub(crate) fn mapped_library(&self) -> Option<String> {
+        dladdr_fname(self.init as *const c_void)
+    }
+
     /// `Ok` for hipSuccess (0); else the stage, call, numeric status and `hipGetErrorString`.
     fn check(&self, stage: &str, call: &str, status: HipStatus) -> Result<(), String> {
         if status == 0 {
@@ -709,6 +754,12 @@ pub struct HipRuntime {
 }
 
 impl HipRuntime {
+    /// The physical `libamdhip64` file this runtime resolved to; see
+    /// [`Api::mapped_library`]. Reading it does not touch HIP state.
+    pub fn mapped_hip_library(&self) -> Option<String> {
+        self.shared.api.mapped_library()
+    }
+
     /// Load HIP, `hipInit`, find the device whose `hipDeviceGetPCIBusId` equals `pci` (e.g. `"0000:bf:00.0"`, ASCII
     /// case-insensitive) and `hipSetDevice` it. No other device is ever selected.
     pub fn load_for_pci(pci: &str) -> Result<Self, String> {
@@ -1558,6 +1609,22 @@ impl RelayApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `dladdr_fname` must resolve a symbol that is definitely mapped: `dlopen`
+    /// itself lives in the process's dynamic linker/libc on every Linux host.
+    /// The two-HIP-runtime guard (#926) trusts this lookup, so it is tested on
+    /// the real dynamic loader rather than a stub.
+    #[test]
+    fn dladdr_fname_resolves_the_object_of_a_live_symbol() {
+        let dlopen_ptr = sys::dlopen as unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void;
+        let path =
+            dladdr_fname(dlopen_ptr as *const c_void).expect("dladdr must resolve dlopen itself");
+        assert!(!path.is_empty());
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "mapped object should exist on disk: {path}"
+        );
+    }
 
     fn name(a: Attempt<'_>) -> (&str, bool) {
         (a.name, a.already_loaded)
