@@ -906,7 +906,6 @@ fn validate_explicit_gpu_arch(arch: &str) -> Result<(), String> {
     ))
 }
 
-
 /// A ROCm root with the HIP runtime but no device compiler, enough to run a
 /// prebuilt kernel pack. An explicit root is taken as given; otherwise the
 /// candidates must share one runtime library.
