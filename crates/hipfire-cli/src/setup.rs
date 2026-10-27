@@ -1650,13 +1650,18 @@ mod tests {
         git(&repo, &["commit", "-q", "-m", "one"]);
         git(&repo, &["tag", "v9.9.9"]);
         assert!(verify_source_tag(&repo, "v9.9.9").is_ok());
-        // HEAD moves past the tag: a verified mismatch must refuse.
+        // HEAD at a different exact tag: a verified mismatch must refuse.
         fs::write(repo.join("f"), b"x").unwrap();
         git(&repo, &["commit", "-q", "-am", "two"]);
+        git(&repo, &["tag", "v8.8.8"]);
         let err = verify_source_tag(&repo, "v9.9.9").unwrap_err();
         assert!(err.contains("v9.9.9"), "{err}");
         assert!(err.contains("not acquired"), "{err}");
-        // A tree that cannot be described passes (cannot verify, dev flows).
+        // HEAD at a commit no tag names cannot be verified and passes (the
+        // dangerous case is a verified mismatch, not an undescribable tree).
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "three"]);
+        assert!(verify_source_tag(&repo, "v9.9.9").is_ok());
+        // A tree without git passes for the same reason.
         let bare = test_base("tag-verify-bare");
         assert!(verify_source_tag(&bare, "v9.9.9").is_ok());
         let _ = fs::remove_dir_all(&repo);
