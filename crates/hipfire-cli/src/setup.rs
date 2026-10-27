@@ -132,7 +132,9 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
     // always a typo; the previous behaviour installed a JIT-only setup that
     // only failed later at model load.
     if let Some(arch) = args.gpu_arch.as_deref() {
-        validate_explicit_gpu_arch(arch)?;
+        if let Err(reason) = validate_explicit_gpu_arch(arch) {
+            bail!("{reason}");
+        }
     }
 
     // Honour explicit --hipcc and --strict-rocm for this run without mutating
