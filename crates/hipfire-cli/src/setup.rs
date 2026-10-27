@@ -1392,7 +1392,8 @@ mod tests {
         ensure_rocm_complete, install_binary_with_backup, metadata_ref_from_parts,
         parse_gpu_arches, pin_cargo_to_source_target, prompt_line_from_read, restore_config_toml,
         rollback_replacements, root_supports_compiler, selection_from_prompt_read,
-        snapshot_config_toml, usable_rocm_roots, BinaryReplacement, ContinueDecision, PromptRead,
+        snapshot_config_toml, usable_rocm_roots, validate_explicit_gpu_arch, verify_source_tag,
+        BinaryReplacement, ContinueDecision, PromptRead,
     };
     use std::{
         env, fs,
